@@ -9,6 +9,7 @@ import tomllib
 import warnings
 import argparse
 import matplotlib
+import collections
 import scipy.signal
 
 import portion as pt
@@ -18,8 +19,7 @@ import matplotlib.pyplot as plt
 import multiprocessing as mp
 
 from enum import StrEnum, auto
-from collections import defaultdict
-from typing import Generator, Any, TextIO, NamedTuple, DefaultDict
+from typing import Generator, Any, TextIO, NamedTuple, DefaultDict, Counter
 
 matplotlib.use("agg")
 warnings.filterwarnings("ignore")
@@ -169,6 +169,12 @@ def parse_args() -> argparse.Namespace:
         default=DEF_CONFIG,
         type=argparse.FileType("rb"),
         help="Additional threshold/params as toml file.",
+    )
+    parser.add_argument(
+        "--reference_asm",
+        required=False,
+        type=str,
+        help="Reference assembly used in alignment. Reduces false positives with dinucleotide repeats.",
     )
     parser.add_argument(
         "--ignore_regions",
@@ -339,6 +345,14 @@ def plot_coverage(
     return fig, ax
 
 
+def get_mer_cnts(seq: str, mer_size: int = 2) -> Counter[str]:
+    mer_counts: Counter[str] = collections.Counter()
+    for i in range(0, len(seq) - 2, mer_size):
+        mer = seq[i : i + mer_size]
+        mer_counts[mer] += 1
+    return mer_counts
+
+
 def peak_finder(
     data: np.ndarray,
     positions: np.ndarray,
@@ -368,11 +382,22 @@ def filter_interval_expr(interval: pt.Interval, *, col: str = "position") -> pl.
     return (pl.col(col) >= interval.lower) & (pl.col(col) <= interval.upper)
 
 
+def most_common_dinuc(
+    fa: pysam.FastaFile, contig: str, start: int, end: int
+) -> tuple[str, float]:
+    seq = fa.fetch(contig, start, end)
+    mer_cnts = get_mer_cnts(seq, mer_size=2)
+    dinuc, cnt = mer_cnts.most_common(1)[0]
+    return dinuc, cnt / mer_cnts.total()
+
+
 def classify_misassemblies(
+    contig: str,
     cov_first_second: np.ndarray,
     positions: np.ndarray,
     *,
     config: dict[str, Any],
+    reference_asm: pysam.FastaFile | None,
     ignored_regions: list[Region] | None,
 ) -> tuple[pl.DataFrame, dict[Misassembly, set[pt.Interval]]]:
     df = pl.DataFrame(
@@ -452,14 +477,33 @@ def classify_misassemblies(
 
     # Classify gaps.
     df_gaps = df.filter(pl.col("first") == 0)
-    misassemblies[Misassembly.GAP] = set(
-        pt.open(grp[0], grp[-1])
-        for grp in consecutive(df_gaps["position"], stepsize=1)
-        if len(grp) > 1
-    )
+    misassemblies[Misassembly.GAP] = set()
+    for grp in consecutive(df_gaps["position"], stepsize=1):
+        region = pt.open(grp[0], grp[-1])
+        if len(grp) > 1:
+            if reference_asm:
+                dinuc, prop = most_common_dinuc(
+                    reference_asm, contig, region.lower, region.upper
+                )
+                if prop > 0.8:
+                    sys.stderr.write(
+                        f"Dinucleotide {dinuc} with high prop {prop} found between {region}. Skipping.\n"
+                    )
+                    continue
+            misassemblies[Misassembly.GAP].add(region)
 
     # Classify misjoins.
     for valley in first_valley_coords:
+        if reference_asm:
+            dinuc, prop = most_common_dinuc(
+                reference_asm, contig, valley.lower, valley.upper
+            )
+            if prop > 0.8:
+                sys.stderr.write(
+                    f"Dinucleotide {dinuc} with high prop {prop} found between {valley}. Skipping.\n"
+                )
+                continue
+
         for second_outlier in second_outliers_coords:
             if second_outlier in valley:
                 misassemblies[Misassembly.MISJOIN].add(valley)
@@ -493,7 +537,7 @@ def classify_misassemblies(
     if not ignored_regions:
         ignored_regions = []
 
-    filtered_misassemblies = defaultdict(set)
+    filtered_misassemblies = collections.defaultdict(set)
     for mtype, regions in misassemblies.items():
         remove_regions = set()
         for region in regions:
@@ -518,6 +562,7 @@ def classify_misassemblies(
 
 def classify_plot_assembly(
     input_bam: str,
+    input_reference_asm: str | None,
     output_dir: str | None,
     threads: int,
     contig: str,
@@ -527,15 +572,21 @@ def classify_plot_assembly(
     ignored_regions: list[Region] | None,
 ) -> pl.DataFrame:
     bam = pysam.AlignmentFile(input_bam, threads=threads)
+    reference_asm = None
+    if input_reference_asm:
+        reference_asm = pysam.FastaFile(input_reference_asm)
+
     contig_name = f"{contig}:{start}-{end}"
 
     sys.stderr.write(f"Reading in NucFreq from region: {contig_name}\n")
 
     df_group_labeled, misassemblies = classify_misassemblies(
+        contig,
         np.flip(
             np.sort(get_coverage_by_base(bam, contig, start, end), axis=1)
         ).transpose(),
         np.arange(start, end),
+        reference_asm=reference_asm,
         config=config,
         ignored_regions=ignored_regions,
     )
@@ -580,8 +631,10 @@ def main():
 
     sys.stderr.write(f"Loaded {len(regions)} region(s).\n")
 
+    sys.stderr.write(f"Using reference assembly: {args.reference_asm}\n")
+
     # Load ignored regions.
-    ignored_regions: DefaultDict[str, list[Region]] = defaultdict(list)
+    ignored_regions: DefaultDict[str, list[Region]] = collections.defaultdict(list)
     if args.ignore_regions:
         for region in read_ignored_regions(args.ignore_regions):
             ignored_regions[region.name].append(region)
@@ -601,6 +654,7 @@ def main():
     # for region in regions:
     #     classify_plot_assembly(
     #         args.input_bam,
+    #         args.reference_asm,
     #         args.output_plot_dir,
     #         args.threads,
     #         *region,
@@ -618,6 +672,7 @@ def main():
             [
                 (
                     args.input_bam,
+                    args.reference_asm,
                     args.output_plot_dir,
                     args.threads,
                     *region,
