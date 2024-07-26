@@ -1,6 +1,6 @@
 matplotlib==3.8.3
 numpy==1.26.4
 polars==0.20.16
-portion==2.4.2
+intervaltree==3.1.0
 pysam==0.22.0
 scipy==1.12.0

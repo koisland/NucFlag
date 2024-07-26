@@ -1,24 +1,25 @@
-import numpy as np
-import polars as pl
-import portion as pt
+from typing import Any, DefaultDict
+
 import matplotlib
 import matplotlib.axes
-import matplotlib.pyplot as plt
 import matplotlib.patches as ptch
+import matplotlib.pyplot as plt
+import numpy as np
+import polars as pl
+from intervaltree import Interval, IntervalTree
 
-from .constants import PLOT_WIDTH, PLOT_HEIGHT, PLOT_YLIM, PLOT_HEIGHT_SCALE_FACTOR
+from .constants import PLOT_HEIGHT, PLOT_HEIGHT_SCALE_FACTOR, PLOT_WIDTH, PLOT_YLIM
 from .misassembly import Misassembly
-from .region import ActionOpt, Region
-from typing import Any, DefaultDict
+from .region import ActionOpt, RegionInfo
 
 
 def plot_coverage(
     df: pl.DataFrame,
-    misassemblies: dict[Misassembly, set[pt.Interval]],
+    misassemblies: dict[Misassembly, IntervalTree],
     contig_name: str,
-    overlay_regions: DefaultDict[int, list[Region]] | None,
+    overlay_regions: DefaultDict[int, IntervalTree],
 ) -> tuple[plt.Figure, Any]:
-    region_bounds = pt.open(df["position"].min(), df["position"].max())
+    region_bounds = Interval(df["position"].min(), df["position"].max())
 
     if overlay_regions:
         number_of_overlap_beds = len(overlay_regions.keys())
@@ -49,7 +50,7 @@ def plot_coverage(
             bed_axs.set_frame_on(False)
 
             # Map uniq types to new color if none given.
-            uniq_types = sorted({r.desc for r in regions if r.desc})
+            uniq_types = sorted({r.data.desc for r in regions.iter() if r.data.desc})
             cmap = dict(
                 zip(
                     uniq_types,
@@ -62,31 +63,34 @@ def plot_coverage(
                 )
             )
 
-            for row in regions:
+            for row in regions.iter():
+                assert isinstance(row, Interval)
+                assert isinstance(row.data, RegionInfo)
+
                 # Skip rows not within bounds of df.
-                if not region_bounds.overlaps(row.region):
+                if not region_bounds.overlaps(row.begin, row.end):
                     continue
 
-                if not row.action or (row.action and row.action.opt != ActionOpt.PLOT):
+                if not row.data.action or (row.data.action.opt != ActionOpt.PLOT):
                     continue
-                width = row.region.upper - row.region.lower
+                width = row.end - row.begin
                 # Use color provided. Default to random generated ones otherwise.
-                if row.action.desc:
-                    color = row.action.desc
-                elif row.desc:
-                    color = cmap[row.desc]
+                if row.data.action.desc:
+                    color = row.data.action.desc
+                elif row.data.desc:
+                    color = cmap[row.data.desc]
                 else:
                     raise ValueError(f"Region {row} has no description.")
 
                 rect = ptch.Rectangle(
-                    (row.region.lower, 0.7),
+                    (row.begin, 0.7),
                     width,
                     0.5,
                     linewidth=1,
                     edgecolor=None,
                     facecolor=color,
                     alpha=0.75,
-                    label=row.desc,
+                    label=row.data.desc,
                 )
                 bed_axs.add_patch(rect)
 
@@ -128,10 +132,11 @@ def plot_coverage(
     # Add misassembly rect patches to highlight region.
     for misasm, misasm_regions in misassemblies.items():
         color = misasm.as_color()
-        for misasm_region in misasm_regions:
+        for misasm_region in misasm_regions.iter():
+            assert isinstance(misasm_region, Interval)
             ax.axvspan(
-                misasm_region.lower,
-                misasm_region.upper,
+                misasm_region.begin,
+                misasm_region.end,
                 color=color,
                 alpha=0.4,
                 label=misasm,

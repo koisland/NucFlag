@@ -1,11 +1,12 @@
 import sys
-import pysam
+from collections import defaultdict
+from typing import DefaultDict, Generator, Iterable, TextIO
 
 import numpy as np
-import portion as pt
+import pysam
+from intervaltree import Interval, IntervalTree
 
-from .region import Action, ActionOpt, IgnoreOpt, Region
-from typing import TextIO, Generator
+from .region import Action, ActionOpt, IgnoreOpt, RegionInfo
 
 
 def get_coverage_by_base(
@@ -57,7 +58,7 @@ def read_asm_regions(
             yield (contig, refs[contig][0], refs[contig][1])
 
 
-def read_regions(bed_file: TextIO) -> Generator[Region, None, None]:
+def read_regions(bed_file: TextIO) -> Generator[Interval, None, None]:
     for line in read_bed_file(bed_file):
         ctg, start, end, other = line
         try:
@@ -79,4 +80,30 @@ def read_regions(bed_file: TextIO) -> Generator[Region, None, None]:
         except IndexError:
             action = None
 
-        yield Region(name=ctg, region=pt.open(start, end), desc=desc, action=action)
+        yield Interval(start, end, RegionInfo(name=ctg, desc=desc, action=action))
+
+
+# TODO: Merge vvv
+
+
+def read_ignored_regions(infile: TextIO) -> DefaultDict[str, IntervalTree]:
+    ignored_regions: DefaultDict[str, IntervalTree] = defaultdict(IntervalTree)
+    for region in read_regions(infile):
+        assert isinstance(region.data, RegionInfo)
+        ignored_regions[region.data.name].add(region)
+
+    return ignored_regions
+
+
+def read_overlay_regions(
+    infiles: Iterable[TextIO],
+) -> DefaultDict[str, DefaultDict[int, IntervalTree]]:
+    overlay_regions: DefaultDict[str, DefaultDict[int, IntervalTree]] = defaultdict(
+        lambda: defaultdict(IntervalTree)
+    )
+    for i, bed in enumerate(infiles):
+        for region in read_regions(bed):
+            assert isinstance(region.data, RegionInfo)
+            overlay_regions[region.data.name][i].add(region)
+
+    return overlay_regions
